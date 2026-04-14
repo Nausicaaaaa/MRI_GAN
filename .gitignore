@@ -1,0 +1,32 @@
+# Python虚拟环境
+MRI_GAN/
+
+# 数据
+data/
+
+# Python缓存
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# 分发/打包
+build/
+dist/
+*.egg-info/
+
+# IDE配置
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# 日志文件
+*.log
+
+# 本地环境配置
+.env
+.venv
+env/
+venv/
