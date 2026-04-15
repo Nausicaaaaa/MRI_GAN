@@ -3,7 +3,8 @@
     "name": [
       "t1ts",
       "t1_ts",
-      "T1."
+      "T1.",
+      "T1"
     ],
     "bias": true,
     "reg_target": "None"

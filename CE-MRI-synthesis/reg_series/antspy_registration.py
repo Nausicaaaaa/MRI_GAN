@@ -10,7 +10,14 @@ import nibabel as nib
 def get_nii_file_name(sdict, workdir):
     series_file_list = os.listdir(workdir)
     tmp_list = series_file_list.copy()
-    for series in sorted(sdict.keys()):
+    
+    # 先处理T1，确保T1优先匹配，避免被其他序列（如PreT1）占用
+    series_order = sorted(sdict.keys())
+    if "T1" in series_order:
+        series_order.remove("T1")
+        series_order.insert(0, "T1")
+    
+    for series in series_order:
         if "filename" not in sdict[series].keys():
             # 遍历json的可能的名字序列
             for series_dict_name in sdict[series]["name"]:
@@ -19,7 +26,11 @@ def get_nii_file_name(sdict, workdir):
                 # 找对应的实际文件名
                 for series_file_name in series_file_list:
                     # json名字对应上实际文件名
+                    # 使用更精确的匹配：检查文件名是否以该序列名开头（避免T1匹配到PreT1）
                     if series_dict_name in series_file_name:
+                        # 额外检查：如果是T1，确保不是PreT1
+                        if series == "T1" and "PreT1" in series_file_name:
+                            continue
                         sdict[series].update({"filename": os.path.join(workdir, series_file_name)})
                         break
         # 若没读到filename，标记为缺失而不是报错

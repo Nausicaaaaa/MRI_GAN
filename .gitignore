@@ -2,7 +2,11 @@
 MRI_GAN/
 
 # 数据
-data/
+data/*
+pre-data/*
+pretrained_weights/*
+train-data/*
+results/
 
 # Python缓存
 __pycache__/

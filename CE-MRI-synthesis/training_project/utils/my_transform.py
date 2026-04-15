@@ -14,10 +14,12 @@ class LoadH5(MapTransform):
 
     def __call__(self, data):
         d = dict(data)
-        h5_file = h5py.File(d[self.path_key])
-        for key in self.keys:
-            d[key] = h5_file[key][()]
-        # d.pop(self.path_key)
+        with h5py.File(d[self.path_key], 'r') as h5_file:
+            for key in self.keys:
+                if key in h5_file:
+                    d[key] = h5_file[key][()]
+                else:
+                    raise KeyError(f"Key '{key}' not found in H5 file: {d[self.path_key]}")
         return d
 
 

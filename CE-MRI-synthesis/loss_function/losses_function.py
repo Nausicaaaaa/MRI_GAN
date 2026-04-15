@@ -5,7 +5,7 @@ from torch.nn import MSELoss, L1Loss
 from torchmetrics.functional.image import multiscale_structural_similarity_index_measure
 
 from loss_function.perceptual_loss import PerceptualLoss
-from loss_function.s3im.s3im import S3IM
+# from loss_function.s3im.s3im import S3IM  # 模块不存在，暂时注释
 from training_project.ce_mri_param import config
 
 device = torch.device("cuda:{}".format(config.cuda_idx))
@@ -18,7 +18,7 @@ vanilla_GAN_loss = networks.GANLoss(use_lsgan=False)
 ls_GAN_loss = networks.GANLoss(use_lsgan=True)
 SSIM_loss = SSIMLoss(spatial_dims=2)
 SSIM_loss_3d = SSIMLoss(spatial_dims=3)
-S3IM_loss = S3IM(kernel_size=7)
+# S3IM_loss = S3IM(kernel_size=7)  # 模块不存在，暂时注释
 # MS_SSIM_loss = MultiScaleStructuralSimilarityIndexMeasure().to(device)
 MS_SSIM_loss = multiscale_structural_similarity_index_measure
 if "Perceptual_loss" in config.loss_weight_dict.keys():
