@@ -86,38 +86,48 @@ class GANLoss(nn.Module):
             create_label = ((self.real_label_var is None) or
                             (self.real_label_var.numel() != input.numel()))
             if create_label:
-                real_tensor = self.Tensor(input.size()).fill_(self.real_label)
-                self.real_label_var = Variable(real_tensor, requires_grad=False)
+                # FP16修复：使用input的dtype和device创建target，避免类型不匹配
+                real_tensor = torch.full(input.size(), self.real_label, 
+                                        dtype=input.dtype, device=input.device)
+                self.real_label_var = real_tensor
             target_tensor = self.real_label_var
         else:
             create_label = ((self.fake_label_var is None) or
                             (self.fake_label_var.numel() != input.numel()))
             if create_label:
-                fake_tensor = self.Tensor(input.size()).fill_(self.fake_label)
-                self.fake_label_var = Variable(fake_tensor, requires_grad=False)
+                # FP16修复：使用input的dtype和device创建target，避免类型不匹配
+                fake_tensor = torch.full(input.size(), self.fake_label, 
+                                        dtype=input.dtype, device=input.device)
+                self.fake_label_var = fake_tensor
             target_tensor = self.fake_label_var
-        return target_tensor.cuda(config.cuda_idx)
+        return target_tensor
 
     def __call__(self, input, target_is_real):
         if isinstance(input[0], list):
             loss = 0
             for input_i in input:
                 pred = input_i[-1]
+                # FP16保护：clamp预测值防止溢出
+                pred = torch.clamp(pred, min=-10.0, max=10.0)
                 target_tensor = self.get_target_tensor(pred, target_is_real)
                 loss += self.loss(pred, target_tensor)
             return loss
         else:            
-            target_tensor = self.get_target_tensor(input[-1], target_is_real)
-            return self.loss(input[-1], target_tensor)
+            pred = input[-1]
+            # FP16保护：clamp预测值防止溢出
+            pred = torch.clamp(pred, min=-10.0, max=10.0)
+            target_tensor = self.get_target_tensor(pred, target_is_real)
+            return self.loss(pred, target_tensor)
 
 class VGGLoss(nn.Module):
-    def __init__(self, gpu_ids):
+    def __init__(self, gpu_ids=None):
         super(VGGLoss, self).__init__()        
-        self.vgg = Vgg19().cuda(gpu_ids)
+        self.vgg = Vgg19()
         self.criterion = nn.L1Loss()
         self.weights = [1.0/32, 1.0/16, 1.0/8, 1.0/4, 1.0]        
 
     def forward(self, x, y):              
+        self.vgg = self.vgg.to(x.device)
         x_vgg, y_vgg = self.vgg(x), self.vgg(y)
         loss = 0
         for i in range(len(x_vgg)):

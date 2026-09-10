@@ -32,7 +32,7 @@ import numpy as np
 import SimpleITK as sitk
 
 # 添加项目路径
-sys.path.insert(0, '/mnt/data/KASR/Dengsiyi/MRI_GAN/CE-MRI-synthesis/reg_series')
+sys.path.insert(0, '/mnt/data/KASR/Dengsiyi/MRI_GAN/CE-MRI-synthesis/preprocessing/reg_series')
 from antspy_registration import get_series, reg_series, make_log, move_resampled_t1_to_regfolder
 
 
@@ -58,7 +58,7 @@ class Config:
     H5_OUTPUT = os.path.join(PROJECT_ROOT, "pre-data", "h5_2d")              # h5格式输出
     
     # 配准参数文件
-    REG_PARAM_FILE = os.path.join(PROJECT_ROOT, "CE-MRI-synthesis", "reg_series", "reg_param", "series_param.json")
+    REG_PARAM_FILE = os.path.join(PROJECT_ROOT, "CE-MRI-synthesis", "preprocessing", "reg_series", "reg_param", "series_param.json")
     
     # 模板图像 (用于T1重采样)
     TEMPLATE_T1 = None  # 将使用第一个患者的T1作为模板

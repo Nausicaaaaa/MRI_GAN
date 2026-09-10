@@ -10,7 +10,7 @@ import numpy as np
 import torch
 from monai.transforms import (
     Compose, LoadImaged, EnsureChannelFirstd,
-    ScaleIntensityd, RandRotated, RandFlipd,
+    ScaleIntensityd, RandRotated, RandFlipd, RandScaleIntensityd,
     ToTensord, Resized, MapTransform
 )
 from training_project.utils.my_transform import LoadH5
@@ -53,45 +53,58 @@ class EnsureChannelFirst(MapTransform):
 
 def get_2d_train_transform(keys, random_prob=0.4):
     """
-    训练集数据预处理
-    
+    训练集数据预处理（已增强：随机翻转、旋转、强度缩放）
+
     Args:
         keys: H5文件中的键名列表，如 ["pret1", "t1", "t2", "dwi", "adc"]
         random_prob: 数据增强概率
     """
+    # 同时加载 mask，用于空间对齐和后续 mask-weighted loss
+    all_keys = keys + ["t1ce", "mask"]
+    # 空间变换插值模式：图像序列用 bilinear，mask 用 nearest
+    mode_list = ["bilinear"] * (len(all_keys) - 1) + ["nearest"]
     return Compose([
-        LoadH5(path_key="path", keys=keys + ["t1ce"]),  # 加载输入序列和目标t1ce
-        ConcatKeys(keys=keys, output_key="image"),  # 拼接输入序列
-        EnsureChannelFirst(keys=["t1ce"]),  # 确保t1ce有通道维度
-        ToTensord(keys=["image", "t1ce"]),  # 转换为Tensor
+        LoadH5(path_key="path", keys=all_keys),
+        # 先给所有数据补上通道维度 [1, H, W]，避免 MONAI 空间变换对纯2D数据产生维度歧义
+        EnsureChannelFirst(keys=all_keys),
+        # 数据增强：随机左右翻转（沿 W 轴）
+        RandFlipd(keys=all_keys, spatial_axis=1, prob=random_prob),
+        # 数据增强：随机上下翻转（沿 H 轴）
+        RandFlipd(keys=all_keys, spatial_axis=0, prob=random_prob),
+        # 数据增强：随机旋转 ±15°
+        RandRotated(keys=all_keys, range_x=0.26, prob=random_prob, mode=mode_list),
+        # 数据增强：随机强度缩放（仅输入序列）
+        RandScaleIntensityd(keys=keys, factors=0.1, prob=random_prob),
+        ConcatKeys(keys=keys, output_key="image"),  # 拼接输入序列 [5, H, W]
+        ToTensord(keys=["image", "t1ce", "mask"]),  # 转换为Tensor
     ])
 
 
 def get_2d_val_transform(keys):
     """
-    验证集数据预处理
-    
+    验证集数据预处理（同时加载 mask，便于后续 mask-weighted 评估）
+
     Args:
         keys: H5文件中的键名列表
     """
     return Compose([
-        LoadH5(path_key="path", keys=keys + ["t1ce"]),
+        LoadH5(path_key="path", keys=keys + ["t1ce", "mask"]),
+        EnsureChannelFirst(keys=keys + ["t1ce", "mask"]),
         ConcatKeys(keys=keys, output_key="image"),
-        EnsureChannelFirst(keys=["t1ce"]),  # 确保t1ce有通道维度
-        ToTensord(keys=["image", "t1ce"]),
+        ToTensord(keys=["image", "t1ce", "mask"]),
     ])
 
 
 def get_2d_test_transform(keys):
     """
     测试集数据预处理
-    
+
     Args:
         keys: H5文件中的键名列表
     """
     return Compose([
-        LoadH5(path_key="path", keys=keys + ["t1ce"]),
+        LoadH5(path_key="path", keys=keys + ["t1ce", "mask"]),
+        EnsureChannelFirst(keys=keys + ["t1ce", "mask"]),
         ConcatKeys(keys=keys, output_key="image"),
-        EnsureChannelFirst(keys=["t1ce"]),  # 确保t1ce有通道维度
-        ToTensord(keys=["image", "t1ce"]),
+        ToTensord(keys=["image", "t1ce", "mask"]),
     ])

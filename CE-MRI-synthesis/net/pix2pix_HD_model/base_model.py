@@ -59,9 +59,9 @@ class BaseModel(torch.nn.Module):
         else:
             #network.load_state_dict(torch.load(save_path))
             try:
-                network.load_state_dict(torch.load(save_path))
+                network.load_state_dict(torch.load(save_path, weights_only=False))
             except:   
-                pretrained_dict = torch.load(save_path)                
+                pretrained_dict = torch.load(save_path, weights_only=False)                
                 model_dict = network.state_dict()
                 try:
                     pretrained_dict = {k: v for k, v in pretrained_dict.items() if k in model_dict}                    

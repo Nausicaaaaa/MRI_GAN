@@ -9,11 +9,25 @@
 
 import os
 import time
+import argparse
+
+import torch
+
+# PyTorch 2.6+ compatibility: default weights_only changed to True.
+# We patch torch.load to default weights_only=False and allowlist argparse.Namespace
+# so that DDP child processes can resume checkpoints correctly.
+_original_torch_load = torch.load
+def _patched_torch_load(*args, **kwargs):
+    # PyTorch 2.6 treats weights_only=None as True internally, so we must override it explicitly
+    if 'weights_only' not in kwargs or kwargs.get('weights_only') is None:
+        kwargs['weights_only'] = False
+    return _original_torch_load(*args, **kwargs)
+torch.load = _patched_torch_load
+torch.serialization.add_safe_globals([argparse.Namespace])
 
 import SimpleITK as sitk
 import lightning.pytorch as pl
 import numpy as np
-import torch
 from monai.data import Dataset, CacheDataset, decollate_batch, DataLoader, pad_list_data_collate
 from monai.inferers import sliding_window_inference
 from monai.metrics import MAEMetric, SSIMMetric
@@ -44,6 +58,7 @@ class Pix2Pix_2d_MulD(pl.LightningModule):
         self.config = config
         self.save_hyperparameters()
         self.automatic_optimization = False
+        print("[Pix2Pix_2d_MulD] __init__ started...")
         # =============================dataset===================================
         self.val_ds = None
         self.train_ds = None
@@ -53,6 +68,8 @@ class Pix2Pix_2d_MulD(pl.LightningModule):
         self.val_batch_size = config.val_batch_size
         self.num_samples = config.num_samples
         self.val_num_samples = config.val_num_samples
+        # 梯度累积步数（模拟更大batch size）
+        self.accumulation_steps = getattr(config, 'accumulation_steps', 1)
         self.dataset_type = config.dataset_type
         self.val_transforms = None
         self.train_transforms = None
@@ -67,6 +84,7 @@ class Pix2Pix_2d_MulD(pl.LightningModule):
         self.fusion_mode = config.fusion_mode
         
         # 基础 UNet 生成器
+        print(f"[Pix2Pix_2d_MulD] Creating base_generator with {input_channels} input channels...")
         base_generator = Unet(encoder_name='timm-regnety_160',
                               encoder_weights=None,  # 无预训练权重（离线环境）
                               encoder_depth=4,
@@ -74,26 +92,46 @@ class Pix2Pix_2d_MulD(pl.LightningModule):
                               # decoder_attention_type="scse",
                               decoder_use_batchnorm=True,
                               in_channels=input_channels, classes=1)
+        print("[Pix2Pix_2d_MulD] base_generator created.")
         
         # 加载本地 RegNetY-160 预训练权重
         encoder_weights_path = getattr(config, 'encoder_weights_path', None)
+        print(f"[Pix2Pix_2d_MulD] encoder_weights_path: {encoder_weights_path}, exists: {os.path.exists(encoder_weights_path) if encoder_weights_path else False}")
         if encoder_weights_path and os.path.exists(encoder_weights_path):
-            print(f"Loading encoder weights from: {encoder_weights_path}")
+            print(f"[Pix2Pix_2d_MulD] Loading encoder weights from: {encoder_weights_path}")
             import safetensors.torch
             state_dict = safetensors.torch.load_file(encoder_weights_path)
             
             # 获取模型当前的状态字典，用于过滤不匹配的层
             model_state_dict = base_generator.encoder.state_dict()
             
+            # safetensors 中的 key 是 timm 格式（如 s1.b1.conv1.bn.weight），
+            # 而 smp encoder 的 key 带有 model. 前缀（如 model.s1.b1.conv1.bn.weight）
+            # 需要建立映射关系
+            # 构建从 "去掉 model. 前缀的 key" -> "原始 model key" 的映射
+            model_key_map = {}
+            for k in model_state_dict.keys():
+                stripped_key = k.replace("model.", "", 1)  # 只去掉第一个 model. 前缀
+                model_key_map[stripped_key] = k
+            
             # 过滤掉形状不匹配的层（通常是第一层卷积，因为输入通道数不同）
             filtered_state_dict = {}
             skipped_keys = []
             for key, value in state_dict.items():
-                if key in model_state_dict:
-                    if value.shape == model_state_dict[key].shape:
-                        filtered_state_dict[key] = value
+                # 跳过 num_batches_tracked 等非参数 key
+                if key.endswith("num_batches_tracked"):
+                    continue
+                
+                target_key = model_key_map.get(key)
+                if target_key is None:
+                    # 尝试直接匹配（带 model. 前缀的情况）
+                    target_key = key if key in model_state_dict else None
+                
+                if target_key and target_key in model_state_dict:
+                    if value.shape == model_state_dict[target_key].shape:
+                        filtered_state_dict[target_key] = value
                     else:
-                        skipped_keys.append(f"{key}: checkpoint {value.shape} vs model {model_state_dict[key].shape}")
+                        skipped_keys.append(f"{key} -> {target_key}: checkpoint {value.shape} vs model {model_state_dict[target_key].shape}")
                 else:
                     skipped_keys.append(f"{key}: not in model")
             
@@ -113,6 +151,7 @@ class Pix2Pix_2d_MulD(pl.LightningModule):
             print(f"Encoder weights loaded successfully! ({len(filtered_state_dict)}/{len(state_dict)} layers loaded)")
         
         # 包装为带有多序列融合模块的生成器
+        print(f"[Pix2Pix_2d_MulD] Creating GeneratorWithFusion (fusion_mode={config.fusion_mode})...")
         self.net_G = GeneratorWithFusion(
             base_generator=base_generator,
             num_series=input_channels,
@@ -122,11 +161,13 @@ class Pix2Pix_2d_MulD(pl.LightningModule):
                 "num_heads": config.transformer_num_heads,
                 "num_layers": config.transformer_num_layers,
                 "dropout": config.transformer_dropout,
-                "spatial_size": config.transformer_spatial_size
+                "spatial_pool_size": getattr(config, 'transformer_spatial_pool_size', getattr(config, 'transformer_spatial_size', 64))
             }
         )
+        print("[Pix2Pix_2d_MulD] GeneratorWithFusion created.")
         
         # self.net_G = attention_unet
+        print("[Pix2Pix_2d_MulD] Creating discriminator...")
         self.net_D = define_D(input_nc=input_channels + output_channel,
                               ndf=64,
                               n_layers_D=config.n_layers_D,
@@ -185,9 +226,10 @@ class Pix2Pix_2d_MulD(pl.LightningModule):
         # 初始化 training output saving
         # self.training_step_output = []
         self.validation_step_outputs = []
+        print("[Pix2Pix_2d_MulD] __init__ completed successfully.")
 
-    def forward(self, x):
-        return self.net_G(x)
+    def forward(self, x, return_attention=False):
+        return self.net_G(x, return_attention=return_attention)
     
     def get_fusion_mode(self):
         """获取当前融合模式"""
@@ -302,11 +344,81 @@ class Pix2Pix_2d_MulD(pl.LightningModule):
         self.best_val_ssim = checkpoint["best_metric"]
         self.best_val_epoch = checkpoint["best_val_epoch"]
         self.criterion_dict = checkpoint["criterion_dict"]
+        
+        # 处理 spatial_conv 结构变更的兼容性（从单卷积改为 Bottleneck 结构）
+        state_dict = checkpoint["state_dict"]
+        old_spatial_conv_key = "net_G.fusion_module.fusion_module.spatial_conv.weight"
+        old_spatial_conv_bias = "net_G.fusion_module.fusion_module.spatial_conv.bias"
+        
+        if old_spatial_conv_key in state_dict:
+            print("[on_load_checkpoint] Detected old spatial_conv structure, migrating to new Bottleneck structure...")
+            # 删除旧的空间卷积权重
+            del state_dict[old_spatial_conv_key]
+            if old_spatial_conv_bias in state_dict:
+                del state_dict[old_spatial_conv_bias]
+            print("[on_load_checkpoint] Removed old spatial_conv weights, new layers will be randomly initialized.")
+            
+            # 结构变更时，删除优化器状态（参数组已变化，不兼容）
+            if 'optimizer_states' in checkpoint:
+                print("[on_load_checkpoint] Removing optimizer states due to model structure change...")
+                del checkpoint['optimizer_states']
+            if 'lr_schedulers' in checkpoint:
+                print("[on_load_checkpoint] Removing lr_schedulers due to model structure change...")
+                del checkpoint['lr_schedulers']
+        
+        # 标记这是 weights-only checkpoint，防止 Lightning 尝试恢复优化器
+        if 'optimizer_states' not in checkpoint:
+            checkpoint['optimizer_states'] = []
+            checkpoint['lr_schedulers'] = []
+            print("[on_load_checkpoint] Added empty optimizer_states to prevent restoration error.")
+    
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
+        """重载权重加载方法，对 spatial_conv 和 channel_attention 的结构变更进行兼容处理"""
+        # 检查是否有旧的 spatial_conv 权重
+        old_key = prefix + "net_G.fusion_module.fusion_module.spatial_conv.weight"
+        if old_key in state_dict:
+            print(f"[_load_from_state_dict] Migrating old spatial_conv structure...")
+            # 删除旧权重
+            del state_dict[old_key]
+            old_bias_key = prefix + "net_G.fusion_module.fusion_module.spatial_conv.bias"
+            if old_bias_key in state_dict:
+                del state_dict[old_bias_key]
+        
+        # 清理新增层的 missing_keys 报告（这些层会随机初始化）
+        new_layer_prefix = prefix + "net_G.fusion_module.fusion_module."
+        new_layer_keys = [
+            "spatial_conv.0.weight", "spatial_conv.0.bias",
+            "spatial_conv.1.weight", "spatial_conv.1.bias",
+            "spatial_conv.2.weight", "spatial_conv.2.bias",
+            "channel_attention.1.weight", "channel_attention.1.bias",
+            "channel_attention.3.weight", "channel_attention.3.bias"
+        ]
+        
+        # 调用父类方法，使用 strict=False 允许缺失新层的权重
+        super()._load_from_state_dict(
+            state_dict, prefix, local_metadata, 
+            strict=False,  # 关键：禁用 strict 模式
+            missing_keys=missing_keys, 
+            unexpected_keys=unexpected_keys, 
+            error_msgs=error_msgs
+        )
+        
+        # 从 missing_keys 中移除已知的新层（避免警告信息）
+        keys_to_ignore = [new_layer_prefix + k for k in new_layer_keys]
+        missing_keys[:] = [k for k in missing_keys if k not in keys_to_ignore]
+    
+    def load_state_dict(self, state_dict, strict=True):
+        """重载 load_state_dict，强制使用 strict=False 以兼容结构变更"""
+        # 强制使用 strict=False
+        return super().load_state_dict(state_dict, strict=False)
 
-    def prepare_data(self):
+    def setup(self, stage=None):
         # prepare data
         # 根据dir 获取train：0 val：1
-        print("preparing data with val")
+        print("[setup] Start preparing datasets...")
+        print(f"[setup] train_dir: {self.train_dir}")
+        print(f"[setup] test_dir: {self.test_dir}")
+        print(f"[setup] template_dir: {self.template_dir}")
         # datasets = sorted(os.listdir(self.train_dir))
         datasets = self.do_split(self.fold_K, self.fold_idx)
         train_dict = self.get_data_dict(datasets[0])
@@ -322,6 +434,7 @@ class Pix2Pix_2d_MulD(pl.LightningModule):
         # 搞搞loss
 
     def train_dataloader(self):
+        print(f"[DataLoader] Creating train_loader with num_workers={self.num_workers}, batch_size={self.train_batch_size}")
         train_loader = DataLoader(
             self.train_ds,
             batch_size=self.train_batch_size,
@@ -330,9 +443,12 @@ class Pix2Pix_2d_MulD(pl.LightningModule):
             pin_memory=True,
             collate_fn=pad_list_data_collate,
         )
+        self._train_dataloader_len = len(train_loader)
+        print(f"[DataLoader] train_loader created, dataset size: {len(self.train_ds)}")
         return train_loader
 
     def val_dataloader(self):
+        print(f"[DataLoader] Creating val_loader with num_workers={self.num_workers}, batch_size={self.val_batch_size}")
         val_loader = DataLoader(
             self.val_ds,
             batch_size=self.val_batch_size,
@@ -341,9 +457,12 @@ class Pix2Pix_2d_MulD(pl.LightningModule):
             pin_memory=True,
             collate_fn=pad_list_data_collate,
         )
+        self._val_dataloader_len = len(val_loader)
+        print(f"[DataLoader] val_loader created, dataset size: {len(self.val_ds)}")
         return val_loader
 
     def predict_dataloader(self):
+        print(f"[DataLoader] Creating predict_loader with num_workers={self.num_workers}")
         pred_loader = DataLoader(
             self.test_ds,
             batch_size=1,
@@ -352,6 +471,7 @@ class Pix2Pix_2d_MulD(pl.LightningModule):
             pin_memory=True,
             collate_fn=pad_list_data_collate,
         )
+        print(f"[DataLoader] predict_loader created, dataset size: {len(self.test_ds) if self.test_ds else 0}")
         return pred_loader
 
     def configure_losses(self):
@@ -362,7 +482,7 @@ class Pix2Pix_2d_MulD(pl.LightningModule):
 
     def configure_optimizers(self):
         optimizer_g = torch.optim.Adam(self.net_G.parameters(), betas=(self.beta1, self.beta2), lr=self.max_lr)
-        optimizer_d = torch.optim.Adam(self.net_D.parameters(), betas=(self.beta1, self.beta2), lr=self.max_lr)
+        optimizer_d = torch.optim.Adam(self.net_D.parameters(), betas=(self.beta1, self.beta2), lr=self.max_lr * 0.5)  # D使用一半学习率，防止过快压制G
         return ({"optimizer": optimizer_g,
                  "lr_scheduler": {"scheduler": CosineAnnealingLR(optimizer_g, self.max_epochs, eta_min=self.min_lr),
                                   "interval": "epoch"}},
@@ -374,9 +494,10 @@ class Pix2Pix_2d_MulD(pl.LightningModule):
         input_concat = torch.cat((input_label, test_image.detach()), dim=1)
         if use_pool:
             fake_query = self.fake_pool.query(input_concat)
-            return self.net_D.forward(fake_query)
+            pred = self.net_D.forward(fake_query)
         else:
-            return self.net_D.forward(input_concat)
+            pred = self.net_D.forward(input_concat)
+        return pred
 
     def on_train_start(self):
         self.print_to_txt("||start with||\n", self.config)
@@ -385,6 +506,8 @@ class Pix2Pix_2d_MulD(pl.LightningModule):
             self.print_to_txt(f"  - Transformer嵌入维度: {self.config.transformer_embed_dim}")
             self.print_to_txt(f"  - Transformer注意力头数: {self.config.transformer_num_heads}")
             self.print_to_txt(f"  - Transformer层数: {self.config.transformer_num_layers}")
+            self.print_to_txt(f"  - 空间池化尺寸: {self.config.transformer_spatial_pool_size}")
+            self.print_to_txt(f"  - 融合方式: 像素级加权 (output = input * weight)")
         self.configure_losses()
 
     def on_train_epoch_start(self):
@@ -394,8 +517,15 @@ class Pix2Pix_2d_MulD(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
         real_A, real_B = (batch["image"], batch["t1ce"])
+        # 获取 mask 并转换为 float，用于 mask-weighted loss
+        mask = batch.get("mask", None)
+        if mask is not None:
+            mask = mask.to(real_B.device).float()
+            if mask.dim() == 3:
+                mask = mask.unsqueeze(1)  # [B, H, W] -> [B, 1, H, W]
         optimizer_G, optimizer_D = self.optimizers()
         fake_B = self.forward(real_A)
+        
         # =========================D==========================
         self.toggle_optimizer(optimizer_D)
         # fake
@@ -411,33 +541,46 @@ class Pix2Pix_2d_MulD(pl.LightningModule):
         elif "ls_GAN_loss" in self.loss_weight_dict.keys():
             loss_D_real = self.criterion_dict["ls_GAN_loss"](pred_real, True)
 
-        # loss&backward
-        loss_D = (loss_D_real + loss_D_fake) * 0.5
-        optimizer_D.zero_grad()
+        # loss&backward（梯度累积：除以accumulation_steps）
+        loss_D = (loss_D_real + loss_D_fake) * 0.5 / self.accumulation_steps
+        
         self.manual_backward(loss_D)
-        optimizer_D.step()
+        # 只在累积足够步数后才更新权重
+        if (batch_idx + 1) % self.accumulation_steps == 0:
+            # 梯度裁剪
+            torch.nn.utils.clip_grad_norm_(self.net_D.parameters(), max_norm=1.0)
+            optimizer_D.step()
+            optimizer_D.zero_grad()
         self.untoggle_optimizer(optimizer_D)
         # =========================G==========================
         # fake
         self.toggle_optimizer(optimizer_G)
-        pred_fake = self.net_D.forward(input=torch.cat((real_A, fake_B), 1))
+        pred_fake_raw = self.net_D.forward(input=torch.cat((real_A, fake_B), 1))
         if "vanilla_GAN_loss" in self.loss_weight_dict.keys():
-            loss_G_GAN = self.criterion_dict["vanilla_GAN_loss"](pred_fake, True)
+            loss_G_GAN = self.criterion_dict["vanilla_GAN_loss"](pred_fake_raw, True)
         elif "ls_GAN_loss" in self.loss_weight_dict.keys():
-            loss_G_GAN = self.criterion_dict["ls_GAN_loss"](pred_fake, True)
-        # dist loss
-        loss_dist, loss_value_dict = distance_loss(self, fake_B, real_B, pred_fake, pred_real)
-        # loss&backward
-        loss_G = loss_G_GAN + loss_dist
-        optimizer_G.zero_grad()
+            loss_G_GAN = self.criterion_dict["ls_GAN_loss"](pred_fake_raw, True)
+        
+        # dist loss（传入 mask 实现前景加权）
+        loss_dist, loss_value_dict = distance_loss(self, fake_B, real_B, pred_fake_raw, pred_real, mask=mask)
+        
+        # loss&backward（梯度累积：除以accumulation_steps）
+        loss_G = (loss_G_GAN + loss_dist) / self.accumulation_steps
         self.manual_backward(loss_G)
-        optimizer_G.step()
+        # 只在累积足够步数后才更新权重
+        if (batch_idx + 1) % self.accumulation_steps == 0:
+            # 梯度裁剪
+            torch.nn.utils.clip_grad_norm_(self.net_G.parameters(), max_norm=1.0)
+            optimizer_G.step()
+            optimizer_G.zero_grad()
         self.untoggle_optimizer(optimizer_G)
         # =========================loss========================================
-        loss_dict = {"G_GAN": loss_G_GAN,
-                     "fake_D": loss_D_fake,
-                     "real_D": loss_D_real}
-        loss_dict.update(loss_value_dict)
+        # 注意：loss_dict需要乘回accumulation_steps以便正确显示
+        loss_dict = {"G_GAN": loss_G_GAN * self.accumulation_steps,
+                     "fake_D": loss_D_fake * self.accumulation_steps,
+                     "real_D": loss_D_real * self.accumulation_steps}
+        loss_value_dict_scaled = {k: v * self.accumulation_steps for k, v in loss_value_dict.items()}
+        loss_dict.update(loss_value_dict_scaled)
         if batch_idx % 160 == 0:
             img_realA = torch.cat((real_A[0][0], real_A[0][1]), dim=1).unsqueeze(0).unsqueeze(0)
             img_realA = tensor2im(img_realA)
@@ -459,11 +602,12 @@ class Pix2Pix_2d_MulD(pl.LightningModule):
         loss_print_content = {}
         for loss_n, loss_v in outputs["loss_dict"].items():
             loss_print_content.update({loss_n: "%.4f" % loss_v.item()})
+        total_batches = getattr(self, '_train_dataloader_len', len(self.train_ds) // self.train_batch_size)
         print_content = "{} / {} {}  || Training cost: {}".format(batch_idx + 1,
-                                                                  len(self.train_dataloader()),
+                                                                  total_batches,
                                                                   loss_print_content,
                                                                   time_str)
-        printProgressBar(batch_idx, len(self.train_dataloader()) - 1, content=print_content)
+        printProgressBar(batch_idx, total_batches - 1, content=print_content)
 
     def on_train_epoch_end(self):
         # epoch lr schedule
@@ -508,8 +652,9 @@ class Pix2Pix_2d_MulD(pl.LightningModule):
         self.validation_step_outputs.append({"val_loss": loss, "val_number": len(outputs)})
 
     def on_validation_batch_end(self, outputs, batch, batch_idx, dataloader_idx: int = 0):
-        printProgressBar(batch_idx, len(self.val_dataloader()) - 1,
-                         content="{}/{} validation processing......".format(batch_idx + 1, len(self.val_dataloader())))
+        total_val_batches = getattr(self, '_val_dataloader_len', len(self.val_ds) // self.val_batch_size)
+        printProgressBar(batch_idx, total_val_batches - 1,
+                         content="{}/{} validation processing......".format(batch_idx + 1, total_val_batches))
 
     def on_validation_epoch_end(self):
         val_loss, num_items, val_ssim = 0, 0, 0
@@ -561,6 +706,19 @@ class Pix2Pix_2d_MulD(pl.LightningModule):
         roi_size = (roi_x, roi_y)
         sw_batch_size = 4
         outputs = sliding_window_inference(images, roi_size, sw_batch_size, self.forward, overlap=0.25, mode='gaussian')
+        
+        # 限制输出值范围到 [-1, 1]，防止模型输出异常值导致图像显示问题
+        outputs = torch.clamp(outputs, -1.0, 1.0)
+        
+        # 应用body mask后处理：将body外部的预测值设为-1.0（背景值）
+        # 这可以消除模型在body外部区域产生的伪影（固定位置的白色斑块）
+        if "mask" in batch:
+            mask = batch["mask"].float()  # [B, 1, H, W] or [B, H, W]
+            if mask.dim() == outputs.dim():
+                outputs = outputs * mask + (-1.0) * (1 - mask)
+            elif mask.dim() == outputs.dim() - 1:
+                mask = mask.unsqueeze(1)  # [B, 1, H, W]
+                outputs = outputs * mask + (-1.0) * (1 - mask)
 
         return id_num, outputs, slice_idx
 
@@ -583,19 +741,52 @@ class Pix2Pix_2d_MulD(pl.LightningModule):
         print("predicting cost:", time_str)
         # 处理临时文件
         print("Converting 2d to 3d")
-        template_path = os.path.join(self.template_dir, os.path.basename(self.test_dir))
+        template_path = self.template_dir
+        skipped_patients = []
+        body_mask_missing = []
         for idx, id_num in enumerate(self.pred_dict.keys()):
-            # all_slice = sorted(os.listdir(os.path.join(temp_dir, id_num)))
-            template_nii = sitk.ReadImage(os.path.join(template_path, id_num, "T1CE.nii.gz"))
+            template_nii_path = os.path.join(template_path, id_num, "T1CE.nii.gz")
+            
+            # 如果模板文件不存在，跳过该患者
+            if not os.path.exists(template_nii_path):
+                skipped_patients.append(id_num)
+                print(f"\n警告: 患者 {id_num} 的模板文件不存在，跳过: {template_nii_path}")
+                continue
+            
+            template_nii = sitk.ReadImage(template_nii_path)
             template_array = sitk.GetArrayFromImage(template_nii)
             pred_array = np.zeros_like(template_array)
             for slice_idx, slice_img in self.pred_dict[id_num].items():
                 pred_array[int(slice_idx)] = slice_img
+            
+            # 二次安全保障：应用body mask，将body外部区域强制设为-1.0
+            # 消除模型在体外区域可能产生的固定位置伪影
+            body_mask_path = os.path.join(template_path, id_num, "body_mask.nii.gz")
+            if not os.path.exists(body_mask_path):
+                # 尝试备选路径
+                body_mask_path = os.path.join(os.path.dirname(template_path), "body_masks", f"{id_num}_body_mask.nii.gz")
+            if os.path.exists(body_mask_path):
+                body_mask = sitk.GetArrayFromImage(sitk.ReadImage(body_mask_path)).astype(np.float32)
+                pred_array = pred_array * body_mask + (-1.0) * (1 - body_mask)
+            else:
+                body_mask_missing.append(id_num)
+            
             pred_nii = sitk.GetImageFromArray(pred_array)
             pred_nii.CopyInformation(template_nii)
             sitk.WriteImage(pred_nii, os.path.join(self.pred_result_dir, "{}_pred.nii.gz".format(id_num)))
             printProgressBar(idx, len(self.pred_dict) - 1,
                              content="{}/{} making prediction nii......".format(idx + 1, len(self.pred_dict)))
-        # print("remove temp file......")
-        # shutil.rmtree(os.path.join(self.pred_result_dir, "temp"))
+        
+        if skipped_patients:
+            print(f"\n共跳过 {len(skipped_patients)} 个患者（模板文件不存在）:")
+            for p in skipped_patients[:10]:
+                print(f"  - {p}")
+            if len(skipped_patients) > 10:
+                print(f"  ... 还有 {len(skipped_patients) - 10} 个")
+        
+        if body_mask_missing:
+            print(f"\n警告: {len(body_mask_missing)} 个患者缺少body mask，未进行体外伪影过滤:")
+            for p in body_mask_missing[:5]:
+                print(f"  - {p}")
+        
         print("Done")

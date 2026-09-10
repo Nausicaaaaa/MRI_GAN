@@ -304,7 +304,7 @@ class TorchvisionModelPerceptualSimilarity(nn.Module):
         else:
             network = resnet50(weights=None)
             if pretrained is True:
-                state_dict = torch.load(pretrained_path)
+                state_dict = torch.load(pretrained_path, weights_only=False)
                 if pretrained_state_dict_key is not None:
                     state_dict = state_dict[pretrained_state_dict_key]
                 network.load_state_dict(state_dict)

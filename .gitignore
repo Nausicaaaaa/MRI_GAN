@@ -1,36 +1,66 @@
-# Python虚拟环境
-MRI_GAN/
-
-# 数据
-data/*
-pre-data/*
-pretrained_weights/*
-train-data/*
-results/
-
-# Python缓存
+# ========== Python ==========
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
 .Python
 
-# 分发/打包
-build/
-dist/
-*.egg-info/
-
-# IDE配置
-.idea/
-.vscode/
-*.swp
-*.swo
-
-# 日志文件
-*.log
-
-# 本地环境配置
+# ========== 虚拟环境 ==========
+MRI_GAN/
 .env
 .venv
 env/
 venv/
+
+# ========== IDE ==========
+.idea/
+.vscode/
+.lingma/
+*.swp
+*.swo
+
+# ========== 数据（患者数据/权重/预处理中间结果） ==========
+data/
+pre-data/
+train-data/
+pretrained_weights/
+C/
+
+# ========== 模型输出（含患者信息，禁止提交） ==========
+output_dicom_*/
+output_trans*/
+output_concat/
+output_attention_vis/
+output/
+vis/
+vis_pred_gt/
+vis_nii_output/
+vis_output/
+results/
+
+# ========== 训练日志 ==========
+lightning_logs/
+CE-MRI-synthesis/lightning_logs/
+CE-MRI-synthesis/inference/lightning_logs/
+
+# ========== 打包文件 ==========
+*.tar.gz
+*.zip
+
+# ========== 临时/调试文件 ==========
+_tmp_*.py
+_tmp_*.txt
+tmp_patients.txt
+fix_P*.py
+
+# ========== 日志/记录 ==========
+*.log
+*.txt
+
+# ========== 文档（将新写readme） ==========
+*.md
+
+# ========== 分发/打包 ==========
+build/
+dist/
+*.egg-info/

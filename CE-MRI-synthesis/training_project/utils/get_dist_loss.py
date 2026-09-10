@@ -3,17 +3,58 @@ import torch
 from loss_function.losses_function import SSIM_loss_3d
 
 
-def distance_loss(self, fake_B, real_B, pred_fake, pred_real):
+def distance_loss(self, fake_B, real_B, pred_fake, pred_real, mask=None):
     loss_value_dict = {}
     loss_dist = 0
+    
     # similarity
     if "L1_loss" in self.loss_weight_dict.keys():
-        loss_G_L1 = self.loss_weight_dict["L1_loss"] * self.criterion_dict["L1_loss"](fake_B, real_B)
+        l1_map = torch.abs(fake_B - real_B)
+        if mask is not None:
+            mask = mask.float()
+            # 策略升级：前景加权 + 亮区增强
+            # 1. 基础前景加权：只在 mask=1 的区域计算 L1
+            mask_sum = mask.sum()
+            if mask_sum < 1e-6:
+                # mask为空时回退到全局L1
+                loss_G_L1 = self.loss_weight_dict["L1_loss"] * l1_map.mean()
+            else:
+                foreground_l1 = (l1_map * mask).sum() / (mask_sum + 1e-6)
+                
+                # 2. 亮区增强：找出真实图中较亮的区域（例如大于均值的部分）
+                # 这里的阈值可以根据实际分布调整，比如取 real_B 的 90% 分位数
+                masked_real = real_B[mask.bool()]
+                if masked_real.numel() > 0:
+                    bright_threshold = torch.quantile(masked_real, 0.9)
+                else:
+                    bright_threshold = real_B.max()
+                bright_mask = (real_B >= bright_threshold).float() * mask
+                
+                # 如果亮区像素太少，则回退到仅使用前景 mask
+                bright_sum = bright_mask.sum()
+                if bright_sum < 10: 
+                    bright_mask = mask
+                    bright_sum = mask_sum
+                    
+                # 给亮区更高的权重 (例如 2.0 倍)
+                bright_l1 = (l1_map * bright_mask).sum() / (bright_sum + 1e-6)
+                
+                loss_G_L1 = self.loss_weight_dict["L1_loss"] * (foreground_l1 + 0.5 * bright_l1)
+        else:
+            loss_G_L1 = self.loss_weight_dict["L1_loss"] * l1_map.mean()
         loss_value_dict["L1_loss"] = loss_G_L1
         loss_dist += loss_G_L1
     if "SSIM_loss" in self.loss_weight_dict.keys():
         if len(fake_B.shape) == 4:
-            loss_G_ssim = self.loss_weight_dict["SSIM_loss"] * self.criterion_dict["SSIM_loss"](fake_B, real_B)
+            # 基础 SSIM loss
+            ssim_val = self.criterion_dict["SSIM_loss"](fake_B, real_B)
+            loss_G_ssim = self.loss_weight_dict["SSIM_loss"] * ssim_val
+            
+            # 如果存在 mask，增加前景区域的 SSIM 约束权重
+            if mask is not None:
+                # 计算前景区域的 SSIM 贡献（简化版：通过 mask 加权像素差异来模拟局部结构约束）
+                # 注意：MONAI 的 SSIMLoss 返回的是标量，这里我们通过增加 L1 的前景权重来辅助
+                pass 
         else:
             loss_G_ssim = self.loss_weight_dict["SSIM_loss"] * SSIM_loss_3d(fake_B, real_B)
         loss_value_dict["SSIM_loss"] = loss_G_ssim

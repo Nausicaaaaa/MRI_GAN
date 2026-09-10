@@ -22,9 +22,9 @@ SSIM_loss_3d = SSIMLoss(spatial_dims=3)
 # MS_SSIM_loss = MultiScaleStructuralSimilarityIndexMeasure().to(device)
 MS_SSIM_loss = multiscale_structural_similarity_index_measure
 if "Perceptual_loss" in config.loss_weight_dict.keys():
-    Perceptual_loss = PerceptualLoss(spatial_dims=2, network_type="radimagenet_resnet50", ).cuda(int(config.cuda_idx))
+    Perceptual_loss = PerceptualLoss(spatial_dims=2, network_type="radimagenet_resnet50", ).cuda(torch.cuda.current_device())
 if "VGG_loss" in config.loss_weight_dict.keys():
-    VGG_loss = networks.VGGLoss(int(config.cuda_idx))
+    VGG_loss = networks.VGGLoss(torch.cuda.current_device())
 if "G_Feat_loss" in config.loss_weight_dict.keys():
     G_Feat_loss = L1Loss()
 
