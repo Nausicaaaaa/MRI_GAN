@@ -53,6 +53,10 @@ _tmp_*.txt
 tmp_patients.txt
 fix_P*.py
 
+# ========== 可视化脚本（保留本地，不同步） ==========
+visualize_3col_compare.py
+visualize_pred_vs_gt.py
+
 # ========== 日志/记录 ==========
 *.log
 *.txt
